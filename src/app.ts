@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { pool } from "./db/database.js";
+import { organisationRoutes } from "./modules/organisation/organisation.routes.js";
 
 export function buildApp() {
     const app = Fastify({
@@ -18,8 +19,9 @@ export function buildApp() {
             status: 'ok',
             dbTime: result.rows[0].now
         };
-    })
+    });
 
+    app.register(organisationRoutes, { prefix: '/organisations' });
 
     return app;
 }
