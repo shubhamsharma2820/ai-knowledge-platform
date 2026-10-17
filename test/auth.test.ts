@@ -3,7 +3,7 @@ import { test, describe, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApp } from '../src/app.js';
 import { pool } from '../src/db/database.js';
-import { verifyPassword } from '../src/security/password.js';
+import { hashPassword, verifyPassword } from '../src/security/password.js';
 
 describe('POST /auth/register - Registration flow tests', () => {
   const app = buildApp();
@@ -256,3 +256,488 @@ describe('POST /auth/register - Registration flow tests', () => {
     ]);
   });
 });
+
+describe('POST /auth/login & GET /auth/me - Authentication & Session tests', () => {
+  const app = buildApp();
+  const originalQuery = pool.query;
+
+  after(async () => {
+    pool.query = originalQuery;
+    await app.close();
+  });
+
+  let validPasswordHash = '';
+  const testPassword = 'Correct-Password-123!';
+  const testEmail = 'user@example.com';
+
+  beforeEach(async () => {
+    if (!validPasswordHash) {
+      validPasswordHash = await hashPassword(testPassword);
+    }
+  });
+
+  test('Login Case 1: Valid credentials -> 200 OK with JWT accessToken', async () => {
+    pool.query = (async () => {
+      return {
+        rows: [
+          {
+            id: 'user-uuid-100',
+            organisation_id: 'org-uuid-200',
+            name: 'Bob Smith',
+            email: testEmail,
+            password_hash: validPasswordHash,
+            is_active: 1,
+            is_deleted: 0,
+          },
+        ],
+      };
+    }) as any;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testEmail,
+        password: testPassword,
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+    const body = JSON.parse(response.body);
+
+    assert.ok(body.accessToken, 'Access token must be present');
+    assert.equal(body.tokenType, 'Bearer');
+    assert.equal(body.expiresIn, 900);
+    assert.deepEqual(body.user, {
+      id: 'user-uuid-100',
+      name: 'Bob Smith',
+      email: testEmail,
+    });
+  });
+
+  test('Login Case 2: Wrong password -> 401 Unauthorized', async () => {
+    pool.query = (async () => {
+      return {
+        rows: [
+          {
+            id: 'user-uuid-100',
+            organisation_id: 'org-uuid-200',
+            name: 'Bob Smith',
+            email: testEmail,
+            password_hash: validPasswordHash,
+            is_active: 1,
+            is_deleted: 0,
+          },
+        ],
+      };
+    }) as any;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testEmail,
+        password: 'wrong-password-here',
+      },
+    });
+
+    assert.equal(response.statusCode, 401);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'INVALID_CREDENTIALS',
+      message: 'Invalid email or password',
+    });
+  });
+
+  test('Login Case 3: User not found -> 401 Unauthorized (timing-safe generic message)', async () => {
+    pool.query = (async () => {
+      return { rows: [] };
+    }) as any;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: 'nonexistent@example.com',
+        password: testPassword,
+      },
+    });
+
+    assert.equal(response.statusCode, 401);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'INVALID_CREDENTIALS',
+      message: 'Invalid email or password',
+    });
+  });
+
+  test('Login Case 4: Inactive account (is_active = 0) -> 403 Forbidden', async () => {
+    pool.query = (async () => {
+      return {
+        rows: [
+          {
+            id: 'user-uuid-100',
+            organisation_id: 'org-uuid-200',
+            name: 'Bob Smith',
+            email: testEmail,
+            password_hash: validPasswordHash,
+            is_active: 0,
+            is_deleted: 0,
+          },
+        ],
+      };
+    }) as any;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testEmail,
+        password: testPassword,
+      },
+    });
+
+    assert.equal(response.statusCode, 403);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'ACCOUNT_UNAVAILABLE',
+      message: 'Account is unavailable',
+    });
+  });
+
+  test('Login Case 5: Missing password -> 400 Bad Request', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testEmail,
+      },
+    });
+
+    assert.equal(response.statusCode, 400);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'VALIDATION_ERROR',
+      message: 'Request validation failed',
+    });
+  });
+
+  test('GET /auth/me Case 1: Valid JWT token -> 200 OK with user & organisation identity', async () => {
+    pool.query = (async (text: string) => {
+      if (typeof text === 'string' && text.includes('FROM users')) {
+        return {
+          rows: [
+            {
+              id: 'user-uuid-100',
+              organisation_id: 'org-uuid-200',
+              role: 'admin',
+              is_active: 1,
+              is_deleted: 0,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    }) as any;
+
+    // Generate valid token using app's JWT instance
+    const token = app.jwt.sign({
+      sub: 'user-uuid-100',
+      organisationId: 'org-uuid-200',
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+      headers: {
+        authorization: `Bearer ${token}`,
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      userId: 'user-uuid-100',
+      organisationId: 'org-uuid-200',
+    });
+  });
+
+  test('GET /auth/me Case 2: Missing authorization header -> 401 Unauthorized', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+    });
+
+    assert.equal(response.statusCode, 401);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'UNAUTHORIZED',
+      message: 'A valid access token is required',
+    });
+  });
+
+  test('GET /auth/me Case 3: Invalid / forged token -> 401 Unauthorized', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+      headers: {
+        authorization: 'Bearer invalid.tampered.token',
+      },
+    });
+
+    assert.equal(response.statusCode, 401);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'UNAUTHORIZED',
+      message: 'A valid access token is required',
+    });
+  });
+
+  test('GET /auth/me Case 4: Expired token -> 401 Unauthorized', async () => {
+    const expiredToken = app.jwt.sign(
+      {
+        sub: 'user-uuid-100',
+        organisationId: 'org-uuid-200',
+      },
+      { expiresIn: '10ms' }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+      headers: {
+        authorization: `Bearer ${expiredToken}`,
+      },
+    });
+
+    assert.equal(response.statusCode, 401);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body, {
+      error: 'UNAUTHORIZED',
+      message: 'A valid access token is required',
+    });
+  });
+});
+
+describe('Full Authentication Lifecycle E2E Flow (Steps 1 to 6)', () => {
+  const app = buildApp();
+  const originalConnect = pool.connect;
+  const originalQuery = pool.query;
+
+  // In-memory database simulation for full flow
+  const inMemoryOrganisations: Array<{ id: string; name: string; slug: string }> = [];
+  const inMemoryUsers: Array<{
+    id: string;
+    organisation_id: string;
+    name: string;
+    email: string;
+    password_hash: string;
+    is_active: number;
+    is_deleted: number;
+  }> = [];
+
+  after(async () => {
+    pool.connect = originalConnect;
+    pool.query = originalQuery;
+    await app.close();
+  });
+
+  beforeEach(() => {
+    inMemoryOrganisations.length = 0;
+    inMemoryUsers.length = 0;
+
+    // Client connection handler for transactions (register)
+    pool.connect = (async () => {
+      const mockClient = {
+        query: async (text: string, params?: any[]) => {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+            return { rows: [] };
+          }
+
+          if (typeof text === 'string' && text.includes('INSERT INTO organisation')) {
+            const org = {
+              id: 'e2e-org-id-1234',
+              name: params?.[0],
+              slug: params?.[1],
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            };
+            inMemoryOrganisations.push(org);
+            return { rows: [org] };
+          }
+
+          if (typeof text === 'string' && text.includes('INSERT INTO users')) {
+            const user = {
+              id: 'e2e-user-id-5678',
+              organisation_id: params?.[0],
+              name: params?.[1],
+              email: params?.[2],
+              password_hash: params?.[3],
+              role: 'owner',
+              is_active: 1,
+              is_deleted: 0,
+            };
+            inMemoryUsers.push(user);
+            return {
+              rows: [
+                {
+                  id: user.id,
+                  organisation_id: user.organisation_id,
+                  name: user.name,
+                  email: user.email,
+                },
+              ],
+            };
+          }
+
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+      return mockClient as any;
+    }) as any;
+
+    // Single query handler (login & requireActiveUser)
+    pool.query = (async (text: string, params?: any[]) => {
+      if (typeof text === 'string' && text.includes('FROM users')) {
+        if (text.includes('WHERE id = $1')) {
+          const id = String(params?.[0] || '');
+          const found = inMemoryUsers.find((u) => u.id === id);
+          return { rows: found ? [found] : [] };
+        }
+        const email = String(params?.[0] || '').toLowerCase().trim();
+        const found = inMemoryUsers.find(
+          (u) => u.email.toLowerCase().trim() === email
+        );
+        return { rows: found ? [found] : [] };
+      }
+      return { rows: [] };
+    }) as any;
+  });
+
+  test('Execute complete 6-step authentication lifecycle', async () => {
+    const testAccount = {
+      organisationName: 'Acme E2E Corp',
+      slug: 'acme-e2e',
+      name: 'E2E Tester',
+      email: 'e2e-tester@example.com',
+      password: 'Strong-Password-1234!',
+    };
+
+    // 1. Register a test account — expect 201 Created
+    const registerResponse = await app.inject({
+      method: 'POST',
+      url: '/auth/register',
+      payload: testAccount,
+    });
+    assert.equal(registerResponse.statusCode, 201, 'Step 1: Expected 201 Created');
+    assert.equal(
+      registerResponse.body.includes('password_hash'),
+      false,
+      'Step 1: Response must not contain password_hash'
+    );
+    const registerData = JSON.parse(registerResponse.body);
+    assert.equal(registerData.organisation.name, testAccount.organisationName);
+    assert.equal(registerData.user.email, testAccount.email);
+
+    // 2. Log in with the correct password — expect 200 and an access token
+    const loginSuccessResponse = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testAccount.email,
+        password: testAccount.password,
+      },
+    });
+    assert.equal(loginSuccessResponse.statusCode, 200, 'Step 2: Expected 200 OK');
+    assert.equal(
+      loginSuccessResponse.body.includes('password_hash'),
+      false,
+      'Step 2: Response must not contain password_hash'
+    );
+    const loginData = JSON.parse(loginSuccessResponse.body);
+    const accessToken = loginData.accessToken;
+    assert.ok(accessToken, 'Step 2: Access token must be present');
+    assert.equal(loginData.tokenType, 'Bearer');
+    assert.equal(loginData.expiresIn, 900);
+
+    // 3. Log in with an incorrect password — expect 401 Unauthorized
+    const loginFailResponse = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: testAccount.email,
+        password: 'Incorrect-Password-999!',
+      },
+    });
+    assert.equal(loginFailResponse.statusCode, 401, 'Step 3: Expected 401 Unauthorized');
+    assert.equal(
+      loginFailResponse.body.includes('password_hash'),
+      false,
+      'Step 3: Response must not contain password_hash'
+    );
+    const failBody = JSON.parse(loginFailResponse.body);
+    assert.equal(failBody.error, 'INVALID_CREDENTIALS');
+
+    // 4. Call /me without a token — expect 401 Unauthorized
+    const meWithoutTokenResponse = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+    });
+    assert.equal(meWithoutTokenResponse.statusCode, 401, 'Step 4: Expected 401 Unauthorized');
+    assert.equal(
+      meWithoutTokenResponse.body.includes('password_hash'),
+      false,
+      'Step 4: Response must not contain password_hash'
+    );
+    const noTokenBody = JSON.parse(meWithoutTokenResponse.body);
+    assert.equal(noTokenBody.error, 'UNAUTHORIZED');
+
+    // 5. Call /me with Authorization: Bearer YOUR_TOKEN — expect 200 OK
+    const meWithTokenResponse = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+      },
+    });
+    assert.equal(meWithTokenResponse.statusCode, 200, 'Step 5: Expected 200 OK');
+    assert.equal(
+      meWithTokenResponse.body.includes('password_hash'),
+      false,
+      'Step 5: Response must not contain password_hash'
+    );
+    const meData = JSON.parse(meWithTokenResponse.body);
+    assert.equal(meData.userId, registerData.user.id);
+    assert.equal(meData.organisationId, registerData.organisation.id);
+
+    // 6. Wait for the token to expire and call /me again — expect 401 Unauthorized
+    const expiredToken = app.jwt.sign(
+      {
+        sub: registerData.user.id,
+        organisationId: registerData.organisation.id,
+      },
+      { expiresIn: '10ms' }
+    );
+    // Wait for the token to expire
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const meExpiredResponse = await app.inject({
+      method: 'GET',
+      url: '/auth/me',
+      headers: {
+        authorization: `Bearer ${expiredToken}`,
+      },
+    });
+    assert.equal(meExpiredResponse.statusCode, 401, 'Step 6: Expected 401 Unauthorized');
+    assert.equal(
+      meExpiredResponse.body.includes('password_hash'),
+      false,
+      'Step 6: Response must not contain password_hash'
+    );
+    const expiredBody = JSON.parse(meExpiredResponse.body);
+    assert.equal(expiredBody.error, 'UNAUTHORIZED');
+  });
+});
+

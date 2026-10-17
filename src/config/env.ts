@@ -3,6 +3,7 @@ import 'dotenv/config';
 export const env = {
     port: Number(process.env.PORT ?? 3000),
     host: process.env.HOST ?? '0.0.0.0',
+    jwtSecret: process.env.JWT_SECRET ?? 'development-jwt-secret-key-at-least-32-chars-long',
     db: {
         host: process.env.DATABASE_HOST ?? 'localhost',
         port: Number(process.env.DATABASE_PORT ?? 5432),

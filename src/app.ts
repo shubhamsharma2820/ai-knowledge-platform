@@ -3,6 +3,9 @@ import { pool } from "./db/database.js";
 import { organisationRoutes } from "./modules/organisation/organisation.routes.js";
 import { authRoutes } from "./modules/auth/auth.routes.js";
 import { registerErrorHandler } from "./errors/error-handler.js";
+import { env } from "./config/env.js";
+import jwt from '@fastify/jwt';
+
 export function buildApp() {
     const app = Fastify({
         logger: process.env.NODE_ENV === 'test' ? false : true,
@@ -14,6 +17,13 @@ export function buildApp() {
         },
     });
     registerErrorHandler(app);
+
+    app.register(jwt, {
+        secret: env.jwtSecret,
+        sign: {
+            expiresIn: '15m',
+        },
+    });
 
     app.get('/health', async () => {
         return {

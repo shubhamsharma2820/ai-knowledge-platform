@@ -1,7 +1,10 @@
 import { pool } from '../../db/database.js';
-import { hashPassword } from '../../security/password.js';
+import { hashPassword, verifyPassword } from '../../security/password.js';
 import { AppError } from '../../errors/app-error.js';
-import type { RegisterInput } from './auth.types.js';
+import type { RegisterInput, 
+    LoginInput
+ } from './auth.types.js';
+ 
 
 export async function register(input: RegisterInput) {
   const passwordHash = await hashPassword(input.password);
@@ -28,10 +31,11 @@ export async function register(input: RegisterInput) {
          email,
          password_hash,
          is_active,
-         is_deleted
+         is_deleted,
+         role
        )
-       VALUES ($1, $2, $3, $4, 1, 0)
-       RETURNING id, organisation_id, name, email`,
+       VALUES ($1, $2, $3, $4, 1, 0, 'owner')
+       RETURNING id, organisation_id, name, email, role`,
       [
         organisation.id,
         input.name.trim(),
@@ -75,4 +79,46 @@ export async function register(input: RegisterInput) {
   } finally {
     client.release();
   }
+}
+
+export async function login(input: LoginInput) {
+  const email = input.email.trim().toLowerCase();
+
+  const result = await pool.query(
+    `SELECT id, organisation_id, name, email, password_hash,
+            is_active, is_deleted
+     FROM users
+     WHERE lower(trim(email)) = $1
+     LIMIT 1`,
+    [email],
+  );
+
+  const user = result.rows[0];
+
+  if (
+    !user ||
+    !user.password_hash ||
+    !(await verifyPassword(user.password_hash, input.password))
+  ) {
+    throw new AppError(
+      'Invalid email or password',
+      401,
+      'INVALID_CREDENTIALS',
+    );
+  }
+
+  if (user.is_active !== 1 || user.is_deleted !== 0) {
+    throw new AppError(
+      'Account is unavailable',
+      403,
+      'ACCOUNT_UNAVAILABLE',
+    );
+  }
+
+  return {
+    id: user.id,
+    organisationId: user.organisation_id,
+    name: user.name,
+    email: user.email,
+  };
 }
