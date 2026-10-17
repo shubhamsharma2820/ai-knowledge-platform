@@ -3,21 +3,40 @@ import * as organisationService from "./organisation.service.js";
 import type { CreateOrganisationInput } from "./organisation.types.js";
 
 export const organisationRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) => {
-    fastify.post<{ Body: CreateOrganisationInput }>('/', async (request, reply) => {
-        const { name, slug } = request.body ?? {};
-        if (!name || !slug) {
-            return reply.status(400).send({ error: "Name and slug are required" });
-        }
-        try {
-            const org = await organisationService.createOrganisation({ name, slug });
-            return reply.status(201).send(org);
-        } catch (error: any) {
-            if (error?.code === '23505') {
-                return reply.status(409).send({ error: "Organisation with this slug already exists" });
-            }
-            throw error;
-        }
+    
+fastify.post<{ Body: CreateOrganisationInput }>(
+  '/',
+  {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['name', 'slug'],
+        additionalProperties: false,
+        properties: {
+          name: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 255,
+          },
+          slug: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 255,
+          },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const organisation = await organisationService.createOrganisation({
+      name: request.body.name,
+      slug: request.body.slug,
     });
+
+    return reply.status(201).send(organisation);
+  },
+);
+
 
     fastify.get('/', async () => {
         return await organisationService.getOrganisations();

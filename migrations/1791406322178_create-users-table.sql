@@ -4,13 +4,14 @@ CREATE TABLE IF NOT EXISTS users (
     organisation_id UUID NOT NULL REFERENCES organisation(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL,
+    password_hash TEXT,
     created_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT),
     is_active SMALLINT NOT NULL DEFAULT 1,
     is_deleted SMALLINT NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_organisation_id ON users(organisation_id);
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uidx ON users (LOWER(TRIM(email)));
 
 -- Down Migration
 DROP TABLE IF EXISTS users;

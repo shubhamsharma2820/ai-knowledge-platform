@@ -12,12 +12,13 @@
     "migrate:redo": "node-pg-migrate redo",
     "migration:up": "node-pg-migrate up",
     "migration:down": "node-pg-migrate down",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test test/**/*.test.ts"
   },
   "keywords": [],
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "argon2": "^0.45.1",
     "dotenv": "^18.0.5",
     "fastify": "^5.12.5",
     "node-pg-migrate": "^9.0.0",

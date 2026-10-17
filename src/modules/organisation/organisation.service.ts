@@ -1,35 +1,46 @@
-import { pool } from "../../db/database.js";
 import type { CreateOrganisationInput, Organisation } from "./organisation.types.js";
+import { AppError } from "../../errors/app-error.js";
+import * as organisationRepository from './organisation.repository.js';
 
-export async function createOrganisation(input: CreateOrganisationInput): Promise<Organisation> {
-    const result = await pool.query<Organisation>(
-        `INSERT INTO organisation (name, slug)
-         VALUES ($1, $2)
-         RETURNING id, name, slug, created_at, updated_at`,
-        [input.name, input.slug]
-    );
-    return result.rows[0]!;
+function isSlugUniqueViolation(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+
+  if (!('code' in error) || error.code !== '23505') {
+    return false;
+  }
+
+  // PostgreSQL default unique constraint name on table organisation column slug is organisation_slug_key
+  return !('constraint' in error) || error.constraint === 'organisation_slug_key';
+}
+
+export async function createOrganisation(
+  input: CreateOrganisationInput,
+): Promise<Organisation> {
+  try {
+    return await organisationRepository.insertOrganisation(input);
+  } catch (error: unknown) {
+    if (isSlugUniqueViolation(error)) {
+      throw new AppError(
+        'Organisation with this slug already exists',
+        409,
+        'ORGANISATION_SLUG_CONFLICT',
+      );
+    }
+
+    throw error;
+  }
 }
 
 export async function getOrganisations(): Promise<Organisation[]> {
-    const result = await pool.query<Organisation>(
-        `SELECT id, name, slug, created_at, updated_at FROM organisation ORDER BY created_at DESC`
-    );
-    return result.rows;
+  return organisationRepository.findOrganisations();
 }
 
 export async function getOrganisationById(id: string): Promise<Organisation | null> {
-    const result = await pool.query<Organisation>(
-        `SELECT id, name, slug, created_at, updated_at FROM organisation WHERE id = $1`,
-        [id]
-    );
-    return result.rows[0] ?? null;
+  return organisationRepository.findOrganisationById(id);
 }
 
 export async function getOrganisationBySlug(slug: string): Promise<Organisation | null> {
-    const result = await pool.query<Organisation>(
-        `SELECT id, name, slug, created_at, updated_at FROM organisation WHERE slug = $1`,
-        [slug]
-    );
-    return result.rows[0] ?? null;
+  return organisationRepository.findOrganisationBySlug(slug);
 }
