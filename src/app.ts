@@ -5,6 +5,7 @@ import { authRoutes } from "./modules/auth/auth.routes.js";
 import { registerErrorHandler } from "./errors/error-handler.js";
 import { env } from "./config/env.js";
 import jwt from '@fastify/jwt';
+import { documentsRoutes } from "./modules/documents/documents.routes.js";
 
 export function buildApp() {
     const app = Fastify({
@@ -41,6 +42,7 @@ export function buildApp() {
 
     app.register(organisationRoutes, { prefix: '/organisations' });
     app.register(authRoutes, { prefix: '/auth' });
+    app.register(documentsRoutes, { prefix: '/documents' });
 
     return app;
 }

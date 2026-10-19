@@ -12,7 +12,8 @@
     "migrate:redo": "node-pg-migrate redo",
     "migration:up": "node-pg-migrate up",
     "migration:down": "node-pg-migrate down",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "tsx --test test/**/*.test.ts src/**/*.test.ts",
+    "test:load": "tsx scripts/load-test.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
