@@ -6,6 +6,7 @@ import { registerErrorHandler } from "./errors/error-handler.js";
 import { env } from "./config/env.js";
 import jwt from '@fastify/jwt';
 import { documentsRoutes } from "./modules/documents/documents.routes.js";
+import { redis } from './db/redis.js';
 
 export function buildApp() {
     const app = Fastify({
@@ -26,6 +27,20 @@ export function buildApp() {
         },
     });
 
+    app.addHook('onReady', async () => {
+        if (!redis.isOpen) {
+            await redis.connect();
+        }
+        const response = await redis.ping();
+        console.log('Redis ping:', response);
+    });
+
+    app.addHook('onClose', async () => {
+        if (redis.isOpen) {
+            await redis.quit();
+        }
+    });
+
     app.get('/health', async () => {
         return {
             status: "ok"
@@ -37,6 +52,14 @@ export function buildApp() {
         return {
             status: 'ok',
             dbTime: result.rows[0].now
+        };
+    });
+
+    app.get('/health/redis', async () => {
+        const ping = await redis.ping();
+        return {
+            status: 'ok',
+            redis: ping
         };
     });
 

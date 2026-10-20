@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 import * as organisationService from "./organisation.service.js";
+import { getOrganisationById } from "./organisations.service.js";
 import type { CreateOrganisationInput } from "./organisation.types.js";
 
 export const organisationRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) => {
@@ -44,7 +45,7 @@ fastify.post<{ Body: CreateOrganisationInput }>(
 
     fastify.get<{ Params: { id: string } }>('/:id', async (request, reply) => {
         const { id } = request.params;
-        const org = await organisationService.getOrganisationById(id);
+        const org = await getOrganisationById(id);
         if (!org) {
             return reply.status(404).send({ error: "Organisation not found" });
         }
