@@ -53,3 +53,22 @@ export async function findOrganisationBySlug(
 
   return result.rows[0] ?? null;
 }
+
+export async function updateOrganisation(
+  id: string,
+  input: { name: string },
+): Promise<Organisation | null> {
+  const result = await pool.query<Organisation>(
+    `UPDATE organisation
+SET
+  name = $2,
+  cache_version = cache_version + 1,
+  updated_at = NOW()
+WHERE id = $1
+RETURNING id, name, slug, cache_version;`,
+    [id, input.name],
+  );
+
+  return result.rows[0] ?? null;
+}
+

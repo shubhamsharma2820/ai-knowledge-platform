@@ -2,6 +2,7 @@ export interface Organisation {
     id: string;
     name: string;
     slug: string;
+    cache_version?: string | number;
     created_at: Date;
     updated_at: Date;
 }

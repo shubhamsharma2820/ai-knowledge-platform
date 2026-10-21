@@ -167,9 +167,108 @@ Execution Time: 0.041 ms
 
 ---
 
-## 🔮 Next Steps: Day 4 (Redis Caching & Resilience)
-* **Redis Integration**: Connect Redis client with connection pooling.
-* **Caching Layer**: Cache tenant documents with TTL and tenant-scoped keys (e.g. `tenant:{orgId}:documents`).
-* **Cache Invalidation**: Event-driven invalidation on document mutations (`POST`, `PATCH`, `DELETE`).
+### Day 4: Redis Caching, Resilience & High-Concurrency Consistency
+
+#### 1. Redis Infrastructure & Fastify Lifecycles
+* **Containerization**: Configured `redis:7-alpine` container running on port `6379`.
+* **Client Architecture**: Singleton `createClient` in [`src/db/redis.ts`](src/db/redis.ts) with centralized connection error logging.
+* **Fastify Lifecycle Hooks**:
+  * `onReady`: Connects to Redis before accepting traffic and verifies connectivity with a ping check.
+  * `onClose`: Gracefully disconnects via `redis.quit()`.
+* **Health Check**: Added `GET /health/redis` endpoint returning Redis server status.
+
+#### 2. Fail-Open Cache Policy
+* For read operations (`GET /organisations/:id`), Redis read and write failures are wrapped in error boundaries (`try/catch`).
+* If Redis experiences downtime, network timeouts, or restarts, requests seamlessly fall back to PostgreSQL as the primary source of truth without returning 500 errors to callers.
+
+#### 3. Singleflight Promise Coalescing (Cache Stampede Mitigation)
+* **Problem**: When a popular cache key expires or upon a cold start, 100 concurrent requests all miss the cache simultaneously, leading to 100 duplicate database queries (thundering herd / cache stampede).
+* **Solution**: In-memory `Map<string, Promise<Organisation | null>>` coalesces all concurrent requests for the same organisation ID into a single shared database lookup promise.
+* **Verification Benchmark** ([`scripts/test-concurrent-stampede.ts`](scripts/test-concurrent-stampede.ts)):
+  * **100 concurrent cold requests** executed simultaneously.
+  * **Database Lookups**: Exactly **1** PostgreSQL lookup.
+  * **Success Rate**: **100%** (100 / 100 requests).
+  * **Subsequent Request Latency**: **`1.17 ms`** (served directly from Redis cache).
+
+#### 4. Cache Versioning & Stale Repopulation Prevention
+* **The Race Condition**: A slow in-flight read starting with old data (`Acme`) could finish after a concurrent database update to `Acme Technologies` and overwrite the freshly invalidated Redis cache with stale data.
+* **Database Migration**: Added column `cache_version BIGINT NOT NULL DEFAULT 1` to `organisation` table ([`migrations/1792519203611_add-cache-version-to-organisation.sql`](migrations/1792519203611_add-cache-version-to-organisation.sql)).
+* **Atomic Version Guard**:
+  When updating an organisation:
+  ```sql
+  UPDATE organisation
+  SET
+    name = $2,
+    cache_version = cache_version + 1,
+    updated_at = NOW()
+  WHERE id = $1
+  RETURNING id, name, slug, cache_version;
+  ```
+* In `getOrganisationById`, Redis writes execute an atomic Lua script that compares `organisation:{id}:version`. If a newer version is already recorded in Redis, the stale write is discarded.
+
+#### 5. Post-Commit Cache Invalidation
+* **Transaction Rollback Safety**: Cache invalidation must never execute before or during an uncommitted database transaction.
+* Database mutations execute within an explicit PostgreSQL transaction block (`BEGIN` ... `COMMIT` / `ROLLBACK`).
+* Strictly **after** the transaction successfully commits, cache invalidation is executed:
+  ```typescript
+  try {
+    if (redis.isOpen) {
+      await redis.set(`organisation:${id}:version`, String(organisation.cache_version), {
+        EX: 300,
+      });
+    }
+    await redis.del(`organisation:${id}`);
+  } catch (error) {
+    console.error('Organisation cache invalidation failed:', error);
+  }
+  ```
+* If the database transaction fails or is aborted, Redis is never modified, completely preventing dirty cache writes.
+
+#### 6. Endpoints
+* `PATCH /organisations/:id` & `PUT /organisations/:id`: Updates organisation name, increments `cache_version`, and triggers post-commit cache invalidation.
+
+---
+
+## 🧪 Testing Suites & Verification
+
+The project runs **32 automated tests across 7 suites** with a 100% pass rate:
+
+```bash
+npm test
+```
+
+### Breakdown of Test Suites
+1. **`test/auth.test.ts`**:
+   * Full 6-step authentication lifecycle E2E flow.
+   * Valid/invalid registration payloads and rollback integrity.
+   * Valid/invalid/expired token lifecycle and inactive user checks.
+2. **`test/organisation.test.ts`**:
+   * Schema validation, slug uniqueness (409 Conflict), and payload constraints.
+3. **`test/documents.test.ts`**:
+   * Critical verification: Database connection executes under `app_user` without `BYPASSRLS`.
+   * Organization A token $\rightarrow$ returns **only** Org A documents.
+   * Organization B token $\rightarrow$ returns **only** Org B documents.
+   * Missing token $\rightarrow$ `401 Unauthorized`.
+   * Valid token for inactive user $\rightarrow$ `401 Unauthorized`.
+4. **`src/modules/documents/documents.rls.test.ts`**:
+   * Direct database-level RLS verification ensuring `SELECT id FROM knowledge_documents` strictly isolates tenant rows.
+5. **`test/cache-race.test.ts`**:
+   * `PATCH /organisations/:id` updates name and increments `cache_version`.
+   * Simulates slow in-flight read and verifies that version-guarded writes reject stale data repopulation.
+   * Verifies post-commit invalidation: cache key is deleted after transaction commit.
+
+---
+
+## ⚡ Performance Metrics Summary
+
+* **Cache Miss Latency**: `~65 ms` (PostgreSQL query + network round-trip).
+* **Cache Hit Latency**: **`~1.17 ms - 3.68 ms`** (**~17.8x - 55x speedup**).
+* **Stampede Test**: 100 concurrent cold hits coalesced into 1 database query.
+* **Baseline Throughput**: `743.02 req/sec` with median latency `23.42 ms`.
+
+---
+
+## 🔮 Next Steps: Day 5 (Rate Limiting & Tenant Document Caching)
+* **Tenant Document Caching**: Cache tenant documents with tenant-scoped keys (e.g. `tenant:{orgId}:documents`).
 * **Rate Limiting**: Sliding-window or token-bucket rate limiter per tenant / user via Redis.
-* **High Availability**: Redis Sentinel & Cluster configuration.
+* **Distributed Locking / Circuit Breaker**: Circuit breaker and bulkheads for downstream failure isolation.

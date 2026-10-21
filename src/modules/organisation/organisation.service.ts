@@ -44,3 +44,11 @@ export async function getOrganisationById(id: string): Promise<Organisation | nu
 export async function getOrganisationBySlug(slug: string): Promise<Organisation | null> {
   return organisationRepository.findOrganisationBySlug(slug);
 }
+
+export async function updateOrganisation(
+  id: string,
+  input: { name: string },
+): Promise<Organisation | null> {
+  return organisationRepository.updateOrganisation(id, input);
+}
+

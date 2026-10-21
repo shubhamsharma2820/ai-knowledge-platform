@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 import * as organisationService from "./organisation.service.js";
-import { getOrganisationById } from "./organisations.service.js";
+import { getOrganisationById, updateOrganisation } from "./organisations.service.js";
 import type { CreateOrganisationInput } from "./organisation.types.js";
 
 export const organisationRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) => {
@@ -51,4 +51,55 @@ fastify.post<{ Body: CreateOrganisationInput }>(
         }
         return org;
     });
+
+    const updateSchema = {
+        params: {
+            type: 'object',
+            required: ['id'],
+            properties: {
+                id: { type: 'string' },
+            },
+        },
+        body: {
+            type: 'object',
+            required: ['name'],
+            additionalProperties: false,
+            properties: {
+                name: {
+                    type: 'string',
+                    minLength: 1,
+                    maxLength: 255,
+                },
+            },
+        },
+    };
+
+    fastify.patch<{ Params: { id: string }; Body: { name: string } }>(
+        '/:id',
+        { schema: updateSchema },
+        async (request, reply) => {
+            const { id } = request.params;
+            const { name } = request.body;
+            const org = await updateOrganisation(id, { name });
+            if (!org) {
+                return reply.status(404).send({ error: "Organisation not found" });
+            }
+            return reply.status(200).send(org);
+        },
+    );
+
+    fastify.put<{ Params: { id: string }; Body: { name: string } }>(
+        '/:id',
+        { schema: updateSchema },
+        async (request, reply) => {
+            const { id } = request.params;
+            const { name } = request.body;
+            const org = await updateOrganisation(id, { name });
+            if (!org) {
+                return reply.status(404).send({ error: "Organisation not found" });
+            }
+            return reply.status(200).send(org);
+        },
+    );
 };
+
