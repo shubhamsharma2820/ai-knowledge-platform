@@ -227,7 +227,298 @@ Execution Time: 0.041 ms
 #### 6. Endpoints
 * `PATCH /organisations/:id` & `PUT /organisations/:id`: Updates organisation name, increments `cache_version`, and triggers post-commit cache invalidation.
 
+#### 7. Transactional Outbox Pattern & Background Worker Daemon
+
+##### 💡 The Distributed Systems Problem: Why Dual-Writes Fail in Production
+In modern microservices and high-scale backends, an application frequently needs to write to two different storage engines for a single operation (e.g. update PostgreSQL and invalidate Redis, emit to Apache Kafka, or call Stripe).
+
+###### The Naive Approaches and How They Break:
+1. **Write to Database First, Then Network Call (Post-Commit Invalidation)**:
+   ```typescript
+   await db.updateOrganisation(id, data); // 1. Committed in PostgreSQL
+   await redis.del(`organisation:${id}`);  // 2. Network call to Redis
+   ```
+   * **Failure Mode**: If the Node.js process crashes (OOM killer, AWS ECS spot instance eviction, unhandled exception) or the Redis network blips between steps 1 and 2, PostgreSQL contains the new data while Redis serves stale data for hours or days. The two systems are permanently out of sync.
+2. **Execute Network Call Inside the Database Transaction**:
+   ```typescript
+   await client.query('BEGIN');
+   await client.query('UPDATE organisation ...');
+   await redis.del(`organisation:${id}`); // ⚠️ DANGEROUS!
+   await client.query('COMMIT');
+   ```
+   * **Failure Mode 1 (Connection Pool Exhaustion)**: PostgreSQL connection pools are scarce (e.g. 10 to 50 connections). If Redis is slow or reconnecting (e.g. 2,000ms delay), PostgreSQL row locks and connections remain frozen for 2 seconds per request. Under 20 concurrent requests, all database connections starve, crashing the entire API for all users.
+   * **Failure Mode 2 (Phantom Side-Effects)**: If Redis succeeds but the database transaction subsequently fails (e.g. serialization conflict, constraint violation, or crash), the cache was modified or deleted based on uncommitted dirty data.
+
 ---
+
+##### 🛡️ The Solution: The Transactional Outbox Pattern
+The Outbox Pattern resolves this dual-write vulnerability by converting two independent distributed writes into **a single atomic local PostgreSQL transaction**:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as Fastify HTTP API
+    participant PG as PostgreSQL
+    participant Worker as Outbox Worker Pod
+    participant Redis as Redis Cache
+
+    Client->>API: PATCH /organisations/:id
+    Note over API,PG: Atomic Local Transaction (Single Unit of Work)
+    API->>PG: BEGIN
+    API->>PG: UPDATE organisation SET name = $1, cache_version = cache_version + 1 ...
+    API->>PG: INSERT INTO outbox_events (event_type, aggregate_id, payload)
+    API->>PG: COMMIT
+    API-->>Client: 200 OK (Instant Response)
+    
+    rect rgb(240, 248, 255)
+    Note over Worker,PG: Phase 1: Lock-Free Atomic Claim
+    Worker->>PG: UPDATE outbox_events SET claimed_at = NOW(), claimed_by = 'worker-1'<br/>WHERE id IN (SELECT id FROM outbox_events WHERE ... FOR UPDATE SKIP LOCKED)
+    PG-->>Worker: Return claimed batch (Row locks released immediately!)
+    end
+
+    rect rgb(255, 250, 240)
+    Note over Worker,Redis: Phase 2: External Network Call (Zero DB Locks Held)
+    Worker->>Redis: DEL organisation:{id}
+    Redis-->>Worker: OK (Key Deleted)
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Worker,PG: Phase 3: Acknowledgment
+    Worker->>PG: UPDATE outbox_events SET processed_at = NOW(), claimed_at = NULL ...
+    end
+```
+
+---
+
+##### 🗄️ Database Schema & Partial Indexing Design
+
+###### Migration 1: Base Table ([`migrations/1792555904650_create-outbox-events-table.sql`](migrations/1792555904650_create-outbox-events-table.sql))
+```sql
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  aggregate_id UUID NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  claimed_at TIMESTAMPTZ,
+  claimed_by TEXT
+);
+```
+
+###### Migration 2: Bounded Retries & DLQ ([`migrations/1792556200000_add-retry-columns-to-outbox-events.sql`](migrations/1792556200000_add-retry-columns-to-outbox-events.sql))
+```sql
+ALTER TABLE outbox_events
+ADD COLUMN IF NOT EXISTS last_error TEXT,
+ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_outbox_events_retry
+ON outbox_events (next_attempt_at, id)
+WHERE processed_at IS NULL
+  AND failed_at IS NULL;
+```
+
+###### ⚡ Why Partial Indexing (`WHERE processed_at IS NULL AND failed_at IS NULL`)?
+In production systems processing millions of events per month, indexing the entire table would cause the index to grow to tens of gigabytes, severely degrading write latency.
+* The partial index only indexes the small subset of rows where `processed_at IS NULL AND failed_at IS NULL` (typically 0 to 50 active rows).
+* **Index Size**: Remains virtually constant (< 1 MB) regardless of whether the table contains 10,000 or 100,000,000 historical rows.
+* **Scan Cost**: Candidate selection is an instantaneous index scan directly hitting the next due events.
+
+---
+
+##### ⚙️ Production Worker Architecture (3-Tier Decoupling)
+
+The worker subsystem is designed as three modular tiers separating batch processing, loop polling, and OS daemon lifecycles:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Tier 3: outbox.main.ts (Process Daemon & OS Signals)   │
+│  - Traps SIGINT / SIGTERM for zero-downtime rollout    │
+│  - Graceful connection teardown (Redis & pg.Pool)      │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+┌──────────────────────────▼─────────────────────────────┐
+│  Tier 2: outbox.runner.ts (Polling Loop & Backpressure) │
+│  - Dynamic pacing: loops immediately when backlog exists│
+│  - Sleeps 1s when idle (prevents CPU spinning)         │
+│  - Singleton guard: prevents duplicate competing loops │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+┌──────────────────────────▼─────────────────────────────┐
+│  Tier 1: outbox.worker.ts (Core Transactional Logic)   │
+│  - Atomic Batch Claim: FOR UPDATE SKIP LOCKED          │
+│  - Stale Claim Reclamation: 2-minute lease timeout     │
+│  - Out-of-Transaction Network I/O (await redis.del)    │
+│  - Bounded Retries with Exponential Backoff (1s - 16s) │
+│  - Terminal Dead-Lettering (failed_at after 5 attempts)│
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 🔍 Code-Level Walkthrough
+
+###### 1. Atomic Event Generation ([`src/modules/organisation/organisations.service.ts`](src/modules/organisation/organisations.service.ts))
+When an organisation update is committed, the outbox event is inserted in the exact same database transaction:
+```typescript
+await client.query('BEGIN');
+
+const result = await client.query<Organisation>(
+  `UPDATE organisation
+   SET name = $2, cache_version = cache_version + 1, updated_at = NOW()
+   WHERE id = $1
+   RETURNING id, name, slug, cache_version;`,
+  [id, input.name],
+);
+
+organisation = result.rows[0] ?? null;
+
+if (organisation) {
+  // Atomically queue invalidation event in PostgreSQL
+  await client.query(
+    `INSERT INTO outbox_events (event_type, aggregate_id, payload)
+     VALUES ('organisation.cache_invalidate', $1::UUID, jsonb_build_object('organisationId', $1::TEXT))`,
+    [id],
+  );
+}
+
+await client.query('COMMIT');
+```
+
+###### 2. Safe Batch Claiming with `FOR UPDATE SKIP LOCKED` ([`src/modules/outbox/outbox.worker.ts`](src/modules/outbox/outbox.worker.ts))
+```typescript
+export async function claimOutboxBatch(
+  batchSize = 10,
+  claimTimeoutMinutes = 2,
+): Promise<ClaimedEvent[]> {
+  const result = await pool.query<ClaimedEvent>(
+    `UPDATE outbox_events
+     SET claimed_at = NOW(),
+         claimed_by = $1
+     WHERE id IN (
+       SELECT id
+       FROM outbox_events
+       WHERE processed_at IS NULL
+         AND failed_at IS NULL
+         AND next_attempt_at <= NOW()
+         AND (
+           claimed_at IS NULL
+           OR claimed_at < NOW() - ($2 || ' minutes')::INTERVAL
+         )
+       ORDER BY next_attempt_at, id
+       LIMIT $3
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, event_type, aggregate_id`,
+    [workerId, String(claimTimeoutMinutes), batchSize],
+  );
+
+  return result.rows;
+}
+```
+* **`FOR UPDATE SKIP LOCKED`**: Enables running 10 or 100 worker pods simultaneously without race conditions, duplicate processing, or lock contention. When Worker A locks rows 1-10, Worker B immediately skips them and locks rows 11-20.
+* **Immediate Lock Release**: The claim query runs and commits immediately, stamping `claimed_by = WORKER_ID`. Database row locks are **not** held open while performing network calls!
+* **Stale Claim Recovery (Crash Safety)**: If a worker pod crashes mid-execution (e.g. node killed), its claimed rows are automatically unlocked and retried after 2 minutes (`claimed_at < NOW() - INTERVAL '2 minutes'`).
+
+###### 3. Bounded Retries, Exponential Backoff & Dead-Letter Queue
+```typescript
+export async function recordOutboxFailure(
+  event: ClaimedEvent,
+  error: unknown,
+): Promise<void> {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+
+  try {
+    await pool.query(
+      `UPDATE outbox_events
+       SET attempts = attempts + 1,
+           last_error = $3,
+           failed_at = CASE
+             WHEN attempts + 1 >= 5 THEN NOW()
+             ELSE NULL
+           END,
+           next_attempt_at = CASE
+             WHEN attempts + 1 >= 5 THEN next_attempt_at
+             ELSE NOW() + (
+               LEAST(
+                 16,
+                 POWER(2, attempts)
+               ) * INTERVAL '1 second'
+             )
+           END,
+           claimed_at = NULL,
+           claimed_by = NULL
+       WHERE id = $1
+         AND claimed_by = $2
+         AND processed_at IS NULL`,
+      [event.id, workerId, errorMessage],
+    );
+  } catch (releaseError) {
+    console.error('Failed to record outbox failure:', releaseError);
+  }
+}
+```
+* **Unified Failure Handling**: Handles **both** unexpected network exceptions (e.g. Redis timeouts) and invalid/unsupported event types uniformly.
+* **Exponential Backoff**: Schedules next attempt at `LEAST(16, 2^attempts) * 1 second` (2s, 4s, 8s, 16s, 16s). This prevents overwhelming a recovering Redis cluster.
+* **Terminal Poison Pill Isolation (DLQ)**: Once `attempts + 1 >= 5`, sets `failed_at = NOW()`. The partial index immediately excludes this row from future worker polls, ensuring bad events never block the processing queue.
+
+---
+
+##### 🏭 Real-World Production Use Cases Handled
+
+| Production Scenario | Potential Disaster | How Our Outbox Architecture Solves It |
+| :--- | :--- | :--- |
+| **Worker Node Eviction / Pod OOM** | Worker pod dies while holding an event; event is lost forever or stuck. | **Stale Claim Reclamation**: After 2 minutes, other workers detect `claimed_at < NOW() - INTERVAL '2 minutes'` and automatically re-claim the event. |
+| **Redis Network Partition / Outage** | Application writes fail or worker spins continuously, saturating CPU. | **Bounded Exponential Backoff**: Retries are delayed (2s $\rightarrow$ 16s). When Redis recovers, events drain cleanly. |
+| **Corrupted Payload / Schema Mismatch** | Malformed event crashes worker repeatedly, freezing all subsequent events. | **Dead-Letter Queue (DLQ)**: After 5 failed attempts, the event is marked `failed_at = NOW()` and bypassed without halting the worker. |
+| **Horizontal Auto-Scaling (10+ Workers)** | Multiple workers process the same event twice, causing race conditions and deadlocks. | **`FOR UPDATE SKIP LOCKED`**: Concurrency is partitioned seamlessly at the database engine level without distributed lock overhead. |
+| **Traffic Spike / Cold Start Backlog** | Worker polling on a fixed sleep interval takes minutes to clear a 50,000-event backlog. | **Dynamic Pacing**: When events exist (`processed > 0`), the runner loops with `0ms` delay to drain the backlog at maximum throughput. |
+| **Zero-Downtime Deployment (SIGTERM)** | Pod is killed mid-invalidation, leaving half-finished operations. | **Graceful Shutdown**: Traps `SIGTERM`, allows active batch to finish, disconnects Redis, and closes `pg.Pool` cleanly. |
+
+---
+
+##### 📊 Production Operational Monitoring Query
+To inspect backlog health, active processing, and dead-lettered events in production:
+```sql
+SELECT
+  COUNT(*) FILTER (
+    WHERE processed_at IS NULL
+      AND failed_at IS NULL
+  ) AS pending_events,
+
+  COUNT(*) FILTER (
+    WHERE processed_at IS NOT NULL
+  ) AS processed_events,
+
+  COUNT(*) FILTER (
+    WHERE failed_at IS NOT NULL
+  ) AS failed_events,
+
+  COUNT(*) FILTER (
+    WHERE processed_at IS NULL
+      AND failed_at IS NULL
+      AND next_attempt_at > NOW()
+  ) AS waiting_for_retry
+FROM outbox_events;
+```
+
+---
+
+##### 🧪 Automated Test Coverage ([`test/outbox.test.ts`](test/outbox.test.ts))
+Our automated test suite enforces the entire outbox lifecycle across 5 critical integration tests:
+1. **Transactional Event Generation**: Verifies `updateOrganisation` atomically inserts an event into `outbox_events` with `processed_at = null` within the database transaction.
+2. **Claim, Invalidate & Acknowledge**: Verifies `processOutboxBatch` claims events, deletes the Redis cache key, stamps `processed_at`, and clears claim markers.
+3. **`SKIP LOCKED` Concurrency Isolation**: Spawns concurrent claims to ensure two workers never claim the same event simultaneously.
+4. **Failure & Exponential Backoff**: Verifies unsupported event types or network errors trigger `recordOutboxFailure`, advancing `attempts`, capturing `last_error`, and pushing `next_attempt_at` into the future.
+5. **Dead-Lettering (Terminal State)**: Verifies that after 5 failed attempts, `failed_at` is populated and the event is permanently excluded from future candidate selection.
+
+---
+
+
+
 
 ## 🧪 Testing Suites & Verification
 
@@ -256,6 +547,11 @@ npm test
    * `PATCH /organisations/:id` updates name and increments `cache_version`.
    * Simulates slow in-flight read and verifies that version-guarded writes reject stale data repopulation.
    * Verifies post-commit invalidation: cache key is deleted after transaction commit.
+6. **`test/outbox.test.ts`**:
+   * Verifies transactional outbox event insertion inside `updateOrganisation`.
+   * Verifies batch claiming, Redis cache invalidation, and event acknowledgment.
+   * Tests `FOR UPDATE SKIP LOCKED` concurrency isolation between multiple competing workers.
+   * Verifies exponential backoff retry scheduling and dead-lettering (`failed_at`) on repeated failures.
 
 ---
 

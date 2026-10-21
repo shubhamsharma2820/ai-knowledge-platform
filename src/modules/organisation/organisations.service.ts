@@ -123,6 +123,14 @@ RETURNING id, name, slug, cache_version;`,
 
     organisation = result.rows[0] ?? null;
 
+    if (organisation) {
+      await client.query(
+        `INSERT INTO outbox_events (event_type, aggregate_id, payload)
+         VALUES ('organisation.cache_invalidate', $1::UUID, jsonb_build_object('organisationId', $1::TEXT))`,
+        [id],
+      );
+    }
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
