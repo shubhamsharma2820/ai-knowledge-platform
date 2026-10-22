@@ -6,11 +6,13 @@ declare module '@fastify/jwt' {
       sub: string;
       organisationId: string;
       role?: 'owner' | 'admin' | 'member';
+      sid?: string;
     };
     user: {
       sub: string;
       organisationId: string;
       role?: 'owner' | 'admin' | 'member';
+      sid?: string;
     };
   }
 }

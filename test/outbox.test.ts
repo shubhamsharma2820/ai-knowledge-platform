@@ -37,6 +37,10 @@ describe('Transactional Outbox Pattern & Worker', () => {
       await pool.query(`DELETE FROM organisation WHERE id = $1`, [testOrgId]);
       await redis.del(cacheKey);
     }
+    if (redis.isOpen) {
+      await redis.quit();
+    }
+    await pool.end();
   });
 
   test('updateOrganisation writes an outbox event into outbox_events inside the transaction', async () => {

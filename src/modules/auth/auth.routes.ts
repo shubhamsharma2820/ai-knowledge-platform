@@ -1,8 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+import { redis } from '../../db/redis.js';
 import { register, login } from './auth.service.js';
 import { authenticate } from './authenticate.js';
-import {requireActiveUser} from './require-active-user.js'
-import {requireRole} from './require-role.js'
+import { requireActiveUser } from './require-active-user.js'
+import { requireRole } from './require-role.js'
+import {
+  logoutSession,
+  logoutAllSessions,
+} from './sessions.service.js'
 
 export const authRoutes: FastifyPluginAsync = async (
   fastify: FastifyInstance,
@@ -65,53 +71,112 @@ export const authRoutes: FastifyPluginAsync = async (
   );
 
   fastify.post(
-  '/login',
-  {
-    schema: {
-      body: {
-        type: 'object',
-        required: ['email', 'password'],
-        additionalProperties: false,
-        properties: {
-          email: { type: 'string', format: 'email', maxLength: 254 },
-          password: { type: 'string', minLength: 1, maxLength: 128 },
+    '/login',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['email', 'password'],
+          additionalProperties: false,
+          properties: {
+            email: { type: 'string', format: 'email', maxLength: 254 },
+            password: { type: 'string', minLength: 1, maxLength: 128 },
+          },
         },
       },
     },
-  },
-  async (request, reply) => {
-    const identity = await login(request.body as {
-      email: string;
-      password: string;
-    });
+    async (request, reply) => {
+      const identity = await login(request.body as {
+        email: string;
+        password: string;
+      });
 
-    const accessToken = fastify.jwt.sign({
-      sub: identity.id,
-      organisationId: identity.organisationId,
-    });
+      const accessToken = fastify.jwt.sign(
+        {
+          sub: identity.id,
+          organisationId: identity.organisationId,
+          sid: identity.sessionId,
+        },
+        {
+          expiresIn: '15m',
+        },
+      );
 
-    return reply.status(200).send({
-      accessToken,
-      tokenType: 'Bearer',
-      expiresIn: 900,
-      user: {
-        id: identity.id,
-        name: identity.name,
-        email: identity.email,
-      },
-    });
-  },
-);
+      return reply.status(200).send({
+        accessToken,
+        tokenType: 'Bearer',
+        expiresIn: 900,
+        user: {
+          id: identity.id,
+          name: identity.name,
+          email: identity.email,
+        },
+      });
+    },
+  );
 
-fastify.get(
-  '/me',
-  { preHandler: [authenticate,requireActiveUser,requireRole('owner', 'admin')] },
-  async (request) => {
-    return {
-      userId: request.user.sub,
-      organisationId: request.user.organisationId,
-    };
-  },
-);
+  fastify.get(
+    '/me',
+    { preHandler: [authenticate, requireActiveUser, requireRole('owner', 'admin')] },
+    async (request) => {
+      return {
+        userId: request.user.sub,
+        organisationId: request.user.organisationId,
+      };
+    },
+  );
+  fastify.post(
+    '/logout',
+    {
+      preHandler: [authenticate, requireActiveUser],
+    },
+    async (request, reply) => {
+      const userId = request.user.sub;
+      const sessionId = request.user.sid;
 
+      if (!sessionId) {
+        return reply.code(401).send({
+          message: 'Invalid session',
+        });
+      }
+
+      try {
+        await logoutSession(userId, sessionId);
+
+        return reply.code(200).send({
+          message: 'Logged out successfully',
+        });
+      } catch (error) {
+        request.log.error({ err: error }, 'Session revocation failed');
+
+        return reply.code(503).send({
+          message: 'Logout temporarily unavailable. Please retry.',
+        });
+      }
+    },
+  );
+
+  fastify.post(
+    '/logout-all',
+    {
+      preHandler: [authenticate, requireActiveUser],
+    },
+    async (request, reply) => {
+      const userId = request.user.sub;
+
+      try {
+        await logoutAllSessions(userId);
+
+        return reply.code(200).send({
+          message: 'Logged out from all devices',
+        });
+      } catch (error) {
+        request.log.error({ err: error }, 'All-session revocation failed');
+
+        return reply.code(503).send({
+          message: 'Logout temporarily unavailable. Please retry.',
+        });
+      }
+    },
+  );
 };

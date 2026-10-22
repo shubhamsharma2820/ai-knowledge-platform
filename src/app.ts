@@ -6,6 +6,7 @@ import { registerErrorHandler } from "./errors/error-handler.js";
 import { env } from "./config/env.js";
 import jwt from '@fastify/jwt';
 import { documentsRoutes } from "./modules/documents/documents.routes.js";
+import { rateLimitRoutes } from "./modules/rate-limit/rate-limit.routes.js";
 import { redis } from './db/redis.js';
 
 export function buildApp() {
@@ -65,7 +66,9 @@ export function buildApp() {
 
     app.register(organisationRoutes, { prefix: '/organisations' });
     app.register(authRoutes, { prefix: '/auth' });
+    app.register(authRoutes, { prefix: '/v1/auth' });
     app.register(documentsRoutes, { prefix: '/documents' });
+    app.register(rateLimitRoutes);
 
     return app;
 }

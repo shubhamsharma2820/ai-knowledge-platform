@@ -552,6 +552,10 @@ npm test
    * Verifies batch claiming, Redis cache invalidation, and event acknowledgment.
    * Tests `FOR UPDATE SKIP LOCKED` concurrency isolation between multiple competing workers.
    * Verifies exponential backoff retry scheduling and dead-lettering (`failed_at`) on repeated failures.
+7. **`test/rate-limit.test.ts`**:
+   * Verifies `/rate-limit-test` endpoint enforcing 5 requests per 60-second fixed window.
+   * Requests 1–5 receive `200 OK` with `X-RateLimit-Limit: 5` and decremented `X-RateLimit-Remaining`.
+   * Request 6 receives `429 Too Many Requests` with `Retry-After: 60`.
 
 ---
 
@@ -564,7 +568,19 @@ npm test
 
 ---
 
-## 🔮 Next Steps: Day 5 (Rate Limiting & Tenant Document Caching)
+## 🚀 Day 5: Redis Rate Limiting & Protection
+
+### 1. Fixed-Window Rate Limiting (`src/modules/rate-limit/`)
+* **Service** ([`src/modules/rate-limit/rate-limit.service.ts`](src/modules/rate-limit/rate-limit.service.ts)):
+  * Tracks request counts per key with a 60-second expiration window.
+  * Calculates `allowed: count <= limit` and `remaining: Math.max(0, limit - count)`.
+* **Test Route** ([`src/modules/rate-limit/rate-limit.routes.ts`](src/modules/rate-limit/rate-limit.routes.ts)):
+  * Mounted at `GET /rate-limit-test`.
+  * Returns rate-limiting headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After: 60` on 429 rejection.
+
+---
+
+## 🔮 Next Steps: Day 5 (Atomic Counter, Sliding-Window & Route Attachment)
+* **Atomic Redis Operation**: Replace non-atomic `INCR` + `EXPIRE` with an atomic Lua script to eliminate orphan keys without TTL.
+* **Tenant & Auth Rate Limiting**: Attach rate limiters to sensitive authentication routes (`/auth/login`) and tenant API quotas.
 * **Tenant Document Caching**: Cache tenant documents with tenant-scoped keys (e.g. `tenant:{orgId}:documents`).
-* **Rate Limiting**: Sliding-window or token-bucket rate limiter per tenant / user via Redis.
-* **Distributed Locking / Circuit Breaker**: Circuit breaker and bulkheads for downstream failure isolation.

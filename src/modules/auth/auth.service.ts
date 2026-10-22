@@ -1,10 +1,13 @@
 import { pool } from '../../db/database.js';
 import { hashPassword, verifyPassword } from '../../security/password.js';
 import { AppError } from '../../errors/app-error.js';
-import type { RegisterInput, 
-    LoginInput
- } from './auth.types.js';
- 
+import type {
+  RegisterInput,
+  LoginInput
+} from './auth.types.js';
+import { redis } from '../../db/redis.js';
+import { randomUUID } from 'node:crypto';
+import { CREATE_SESSION_SCRIPT } from './sessions.service.js';
 
 export async function register(input: RegisterInput) {
   const passwordHash = await hashPassword(input.password);
@@ -114,11 +117,35 @@ export async function login(input: LoginInput) {
       'ACCOUNT_UNAVAILABLE',
     );
   }
+  const sessionId = randomUUID();
+
+  const sessionKey = `session:${sessionId}`;
+  const userSessionsKey = `user-sessions:${user.id}`;
+  const sessionVersionKey = `user-session-version:${user.id}`;
+
+  const sessionData = JSON.stringify({
+    userId: user.id,
+    organisationId: user.organisation_id,
+  });
+
+  await redis.eval(CREATE_SESSION_SCRIPT, {
+    keys: [
+      sessionKey,
+      userSessionsKey,
+      sessionVersionKey,
+    ],
+    arguments: [
+      sessionData,
+      '900',
+      sessionId,
+    ],
+  });
 
   return {
     id: user.id,
     organisationId: user.organisation_id,
     name: user.name,
     email: user.email,
+    sessionId,
   };
 }
