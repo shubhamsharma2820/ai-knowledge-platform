@@ -1,5 +1,6 @@
 import { pool } from '../../db/database.js';
 import { redis } from '../../db/redis.js';
+export { acquireOrganisationLock, acquireLock, type LockAcquisition } from './lock.service.js';
 
 type Organisation = {
   id: string;

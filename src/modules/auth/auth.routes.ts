@@ -8,7 +8,7 @@ import { requireRole } from './require-role.js'
 import {
   logoutSession,
   logoutAllSessions,
-} from './sessions.service.js'
+} from './sessions.service.js';
 
 export const authRoutes: FastifyPluginAsync = async (
   fastify: FastifyInstance,
